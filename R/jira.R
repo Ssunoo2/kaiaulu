@@ -765,3 +765,336 @@ create_status <- function(jira_domain_url, status) {
 
   return(status)
 }
+
+#' Define function to fetch issues from JIRA REST API and save as JSON
+#'
+#' Download issue data from "rest/api/lastest/search" endpoint
+#'
+#' @param domain Custom JIRA domain URL set in config file
+#' @param credentials a path to text file containing your username/api token
+#' @param jql_query Specific query string to specify criteria for fetching
+#' @param fields List of fields that are downloaded in each issue
+#' @param save_path_issue_tracker_issues Path that files will be save along
+#' @param maxResults (optional) the maximum number of results to download per page.
+#' Default is 50
+#' @param verbose boolean flag to specify printing operational
+#' messages or not
+#' @param maxDownloads Maximum downloads per function call
+#' @param search_query an optional API parameter that alters the GET request
+#' @export
+
+download_and_save_jira_issues <- function(domain,
+                                          credentials,
+                                          jql_query,
+                                          fields,
+                                          save_path_issue_tracker_issues,
+                                          maxResults = 50,
+                                          verbose = FALSE,
+                                          maxDownloads = 5000,
+                                          search_query = NULL) {
+
+  # Ensure the domain starts with https:// for secure communication.
+  if (!grepl("^https?://", domain)) {
+    domain <- paste0("https://", domain)
+  }
+
+  # append search_query to jql_query if present
+  if (!is.null(search_query)){
+    jql_query <- paste(jql_query, search_query)
+    message(jql_query)
+  }
+
+  #Initialize variables for pagination
+  startAt <- 0
+  total <- maxResults
+  all_issues <- list()
+  # This variable counts your download count. This is important to not exceed the max downloads per hour
+  downloadCount <- 0
+  time <- Sys.time()
+  message("Starting Downloads at ", time)
+  # Loop that downloads each issue into a file
+  repeat{
+
+    # Check update our download count and see if it is approaching the limit
+    if (downloadCount + maxResults > maxDownloads) {
+      # erorr message
+      time <- Sys.time()
+      message("Cannot download as maxDownloads will be exceeeded. Reccommend running again at a later time. Downloads ended at ", time)
+      break
+    } # Resume donwloading
+
+    # Construct the API endpoint URL
+    url <- paste0(domain, "/rest/api/2/search")
+
+    #Authenticate if username and password are provided
+    if(length(credentials) >= 2) {
+      username <- credentials[1]
+      password <- credentials[2]
+      # Use the credentials for authentication
+      auth <- httr::authenticate(as.character(username), as.character(password), "basic")
+      #message("successfully authenticated")
+    } else {
+      if(verbose){
+        message("No credentials present or are formatted incorrectly.")
+      }
+      auth <- NULL
+    }
+
+    # Prepare query parameters for the API call
+    query_params <- list(jql = jql_query, fields = paste(fields, collapse = ","), maxResults = maxResults, startAt = startAt)
+
+    if (verbose && (downloadCount == 0)){
+      message("Query paramters: ", query_params)
+    }
+    # Make the API call
+    response <- httr::GET(url, query = query_params)
+
+    # Stop if there's an HTTP error
+    if (httr::http_error(response)) {
+      stop("API request failed: ", httr::http_status(response)$message)
+    }
+
+    # Extract issues. for iteration of naming convention and checks
+    R_object_content <- jsonlite::fromJSON(httr::content(response, "text", encoding = "UTF-8"),
+                                   simplifyVector = FALSE)
+    # The number of issues downloaded
+    issue_count <- length(R_object_content$issues)
+    # save the raw content for a writeLines later
+    raw_content <- httr::content(response, "text", encoding = "UTF-8")
+
+    #message(class(response_content))
+    #io_make_file(save_path_issue_tracker_issues, response_content)
+    #jsonlite::write_json(response_content, save_path_issue_tracker_issue_comments)
+
+    # Check to make sure that the api is downloading the correct amount of issues specified by maxResults
+    # This checks for only the first page (if downloadCount ==0)
+    # If the total number of issues retrieved is less than maxResults, then of course issue_count
+    # will be < maxResults so we check to make sure this is not true (total >= maxResults)
+    if ((downloadCount == 0) && (maxResults != issue_count) && (total > maxResults)) {
+      message("Total number of issues queried: ", total)
+      message(". maxResults specified: ", maxResults)
+      message(". Number of issues retrieved: ", issue_count)
+      message(". Something went wrong with the API request. Changing maxResults to ", issue_count)
+      maxResults <- issue_count
+    }
+    # R_object_content <- jsonlite::read_json(response_content, simplifyVector = FALSE)
+    # all_issues <- append(all_issues, content$issues)
+
+    # Set the filename from the config file. It will be modified in the following code
+    file_name <- save_path_issue_tracker_issues
+
+    if (grepl("\\.json$", file_name)) {
+      # Remove .json if present in file_name. It will be added again in the naming convention
+      file_name <- sub("\\.json$", "", file_name)
+    }
+
+    # naming convention for each page
+    for (i in rev(seq_along(R_object_content$issues))) {
+      if (i == 1){
+        issue <- R_object_content$issue[[i]]
+        # Get the 'created' field
+        issue_created <- issue$fields$created
+        # Convert the time string to a POSIXct object, specifying the format
+        posix_time <- as.POSIXct(issue_created, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC")
+        # Convert the POSIXct object to UNIX time
+        unix_time <- as.numeric(posix_time)
+        # append to the filename
+        file_name <- paste0(file_name, "_", unix_time, ".json")
+        # less lines? But less readable
+        # file_name <- paste0(file_name, "_", as.numeric(as.POSIXct(R_object_content$issue[[i]]$fields$created, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC")), ".json")
+      }
+      if (i == issue_count){
+        issue <- R_object_content$issue[[i]]
+        # Get the 'created' field
+        issue_created <- issue$fields$created
+        # Convert the time string to a POSIXct object, specifying the format
+        posix_time <- as.POSIXct(issue_created, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC")
+        # Convert the POSIXct object to UNIX time
+        unix_time <- as.numeric(posix_time)
+        # append to the filename
+        file_name <- paste0(file_name, "_", unix_time)
+      }
+    }
+
+    # write the files if issues present
+    if (issue_count > 0){
+      writeLines(raw_content, file_name)
+    } else {
+      if(verbose){
+        message("You are all caught up!")
+      }
+    }
+
+    # update downloadCount and optional print statements
+    downloadCount <- downloadCount + issue_count
+    if (verbose && (issue_count > 0)){
+      message("saved file to ", file_name)
+      message("Saved ", downloadCount, " total issues")
+    }
+
+
+    #updates startat for next loop
+    if (issue_count < maxResults) {
+      break
+    } else {
+      startAt <- startAt + maxResults
+    }
+  }
+
+  # Final verbose output
+  if (verbose) {
+    message("Success! Fetched and saved issues.")
+  }
+
+  # Returns the content so that it can be saved to a variable via function call
+  return(NULL)
+}
+
+
+#' Define function to fetch issues from 'created' date ranges from JIRA REST API and save as JSON
+#'
+#' Download issue data from "rest/api/lastest/search" endpoint
+#'
+#' @param domain Custom JIRA domain URL set in config file
+#' @param credentials a path to text file containing your username/api token
+#' @param jql_query Specific query string to specify criteria for fetching
+#' @param fields List of fields that are downloaded in each issue
+#' @param save_path_issue_tracker_issues Path that files will be save along
+#' @param maxResults (optional) the maximum number of results to download per page.
+#' Default is 50
+#' @param verbose boolean flag to specify printing operational
+#' messages or not
+#' @param maxDownloads Maximum downloads per function call
+#' @param date_lower_bound an optional API parameter that alters the GET request
+#' @param date_upper_bound an optional API parameter that alters the GET request
+#' @export
+download_and_save_jira_issues_by_created <- function(domain,
+                                                     credentials,
+                                                     jql_query,
+                                                     fields,
+                                                     save_path_issue_tracker_issues,
+                                                     maxResults,
+                                                     verbose,
+                                                     maxDownloads,
+                                                     date_lower_bound = NULL,
+                                                     date_upper_bound = NULL){
+  created_query <- ""
+  if (!is.null(date_lower_bound)){
+    created_query <- paste0(created_query, "AND created >= '", date_lower_bound, "' ")
+  }
+  if (!is.null(date_upper_bound)){
+    created_query <- paste0(created_query, "AND created <= '", date_upper_bound, "' ")
+  }
+
+  message("Appending ", created_query, " to api request.")
+
+  download_and_save_jira_issues(domain,
+                                credentials,
+                                jql_query,
+                                fields,
+                                save_path_issue_tracker_issues,
+                                maxResults,
+                                verbose,
+                                maxDownloads,
+                                search_query = created_query)
+}
+
+#' Define function to fetch issues from 'created' date ranges from JIRA REST API and save as JSON
+#'
+#' Download issue data from "rest/api/lastest/search" endpoint
+#'
+#' @param domain Custom JIRA domain URL set in config file
+#' @param credentials a path to text file containing your username/api token
+#' @param jql_query Specific query string to specify criteria for fetching
+#' @param fields List of fields that are downloaded in each issue
+#' @param save_path_issue_tracker_issues Path that files will be save along
+#' @param maxResults (optional) the maximum number of results to download per page.
+#' Default is 50
+#' @param verbose boolean flag to specify printing operational
+#' messages or not
+#' @param maxDownloads Maximum downloads per function call
+#' @param issueKey_lower_bound an optional API parameter that alters the GET request
+#' @param issueKey_upper_bound an optional API parameter that alters the GET request
+#' @export
+download_and_save_jira_issues_by_issueKey <- function(domain,
+                                                      credentials,
+                                                      jql_query,
+                                                      fields,
+                                                      save_path_issue_tracker_issues,
+                                                      maxResults,
+                                                      verbose,
+                                                      maxDownloads,
+                                                      issueKey_lower_bound = NULL,
+                                                      issueKey_upper_bound = NULL){
+  created_query <- ""
+  if (!is.null(issueKey_lower_bound)){
+    created_query <- paste0(created_query, "AND issueKey >= ", issueKey_lower_bound)
+  }
+  if (!is.null(issueKey_upper_bound)){
+    created_query <- paste0(created_query, " AND issueKey <= ", issueKey_upper_bound)
+  }
+
+  message("Appending ", created_query, " to api request.")
+
+  download_and_save_jira_issues(domain,
+                                credentials,
+                                jql_query,
+                                fields,
+                                save_path_issue_tracker_issues,
+                                maxResults,
+                                verbose,
+                                maxDownloads,
+                                search_query = created_query)
+}
+
+#' Define function to extract greatest issueKey from a file and pass it to download_and_save_jira_issues_by_issueKey
+#'
+#' Download issue data from "rest/api/2/search" endpoint
+#'
+#' @param domain Custom JIRA domain URL set in config file
+#' @param credentials a path to text file containing your username/api token
+#' @param jql_query Specific query string to specify criteria for fetching
+#' @param fields List of fields that are downloaded in each issue
+#' @param save_path_issue_tracker_issues Path that files will be save along
+#' @param maxResults (optional) the maximum number of results to download per page.
+#' Default is 50
+#' @param verbose boolean flag to specify printing operational
+#' messages or not
+#' @param maxDownloads Maximum downloads per function call
+#' @param file_name The filename that contains the greatest issueKey. Returned by a parser
+#' @param unaltered_file_path the unaltered filepath set in the config file
+#' @export
+download_and_save_jira_issues_refresh <- function(domain,
+                                                  credentials,
+                                                  jql_query,
+                                                  fields,
+                                                  save_path_issue_tracker_issues,
+                                                  maxResults,
+                                                  verbose,
+                                                  maxDownloads,
+                                                  file_name,
+                                                  unaltered_file_path){
+
+  issue_refresh <- paste0(unaltered_file_path, file_name)
+
+  # Read the JSON file
+  json_data <- jsonlite::fromJSON(txt = issue_refresh, simplifyVector = FALSE)
+
+  # Extract the value with the greatest issueKey
+  issue_first <- json_data$issue[[1]]['key']
+
+  # Construct the search query to append to the JIRA API request
+  search_query <- paste0("AND issueKey > ", issue_first)
+
+  message("Appending ", search_query, " to JQL query")
+
+  download_and_save_jira_issues(domain,
+                                credentials,
+                                jql_query,
+                                fields,
+                                save_path_issue_tracker_issues,
+                                maxResults,
+                                verbose,
+                                maxDownloads,
+                                search_query)
+}
